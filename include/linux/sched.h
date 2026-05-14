@@ -520,7 +520,7 @@ struct sched_entity {
 	struct load_weight		load;
 	struct rb_node			run_node;
 	u64				deadline;
-	u64				min_deadline;
+	u64				min_vruntime;
 	u64				min_slice;
 	u64				max_slice;
 

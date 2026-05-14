@@ -558,7 +558,7 @@ static inline u64 min_vruntime(u64 min_vruntime, u64 vruntime)
 static inline int entity_before(struct sched_entity *a,
 				struct sched_entity *b)
 {
-	return (s64)(a->vruntime - b->vruntime) < 0;
+	return (s64)(a->deadline - b->deadline) < 0;
 }
 
 static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -619,6 +619,15 @@ sum_w_vruntime_sub(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	cfs_rq->sum_w_vruntime -= key * weight;
 	cfs_rq->sum_weight -= weight;
+}
+
+static inline unsigned long avg_vruntime_weight(struct cfs_rq *cfs_rq, unsigned long weight)
+{
+	unsigned long w = scale_load_down(weight);
+#ifdef CONFIG_64BIT
+	w <<= cfs_rq->sum_shift;
+#endif
+	return w;
 }
 
 static inline void update_zero_vruntime(struct cfs_rq *cfs_rq, s64 delta)
@@ -741,27 +750,20 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 	long load = cfs_rq->sum_weight;
 
 	if (curr && curr->on_rq) {
-		unsigned long weight = scale_load_down(curr->load.weight);
+		unsigned long weight = avg_vruntime_weight(cfs_rq, curr->load.weight);
 
 		avg += entity_key(cfs_rq, curr) * weight;
-		load += weight;
+		load += scale_load_down(curr->load.weight);
 	}
 
 	key = (s64)(vruntime - cfs_rq->zero_vruntime);
 
 #ifdef CONFIG_64BIT
-#ifdef CONFIG_ARCH_SUPPORTS_INT128
-	return avg >= (__int128)key * load;
-#else
 	{
-		s64 rhs;
-
-		if (check_mul_overflow(key, load, &rhs))
-			return key <= 0;
-
-		return avg >= rhs;
+		__int128 rhs = (__int128)key * load;
+		rhs <<= cfs_rq->sum_shift;
+		return (__int128)avg >= rhs;
 	}
-#endif
 #else
 	return avg >= key * load;
 #endif
@@ -782,12 +784,12 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
 
 #define deadline_gt(field, lse, rse) ({ (s64)((lse)->field - (rse)->field) > 0; })
 
-static inline void __update_min_deadline(struct sched_entity *se, struct rb_node *node)
+static inline void __update_min_vruntime(struct sched_entity *se, struct rb_node *node)
 {
 	if (node) {
 		struct sched_entity *rse = __node_2_se(node);
-		if (deadline_gt(min_deadline, se, rse))
-			se->min_deadline = rse->min_deadline;
+		if (deadline_gt(min_vruntime, se, rse))
+			se->min_vruntime = rse->min_vruntime;
 	}
 }
 
@@ -810,20 +812,20 @@ static inline void __max_slice_update(struct sched_entity *se, struct rb_node *n
 }
 
 /*
- * se->min_deadline = min(se->deadline, left->min_deadline, right->min_deadline)
+ * se->min_vruntime = min(se->vruntime, left->min_vruntime, right->min_vruntime)
  * se->min_slice    = min(se->slice, left->min_slice, right->min_slice)
  * se->max_slice    = max(se->slice, left->max_slice, right->max_slice)
  */
-static inline bool min_deadline_update(struct sched_entity *se, bool exit)
+static inline bool min_vruntime_update(struct sched_entity *se, bool exit)
 {
-	u64 old_min_deadline = se->min_deadline;
+	u64 old_min_vruntime = se->min_vruntime;
 	u64 old_min_slice = se->min_slice;
 	u64 old_max_slice = se->max_slice;
 	struct rb_node *node = &se->run_node;
 
-	se->min_deadline = se->deadline;
-	__update_min_deadline(se, node->rb_right);
-	__update_min_deadline(se, node->rb_left);
+	se->min_vruntime = se->vruntime;
+	__update_min_vruntime(se, node->rb_right);
+	__update_min_vruntime(se, node->rb_left);
 
 	se->min_slice = se->slice;
 	__min_slice_update(se, node->rb_right);
@@ -833,13 +835,13 @@ static inline bool min_deadline_update(struct sched_entity *se, bool exit)
 	__max_slice_update(se, node->rb_right);
 	__max_slice_update(se, node->rb_left);
 
-	return se->min_deadline == old_min_deadline &&
+	return se->min_vruntime == old_min_vruntime &&
 	       se->min_slice == old_min_slice &&
 	       se->max_slice == old_max_slice;
 }
 
-RB_DECLARE_CALLBACKS_MAX(static, min_deadline_cb, struct sched_entity,
-		     run_node, u64, min_deadline, min_deadline_update);
+RB_DECLARE_CALLBACKS_MAX(static, min_vruntime_cb, struct sched_entity,
+		     run_node, u64, min_vruntime, min_vruntime_update);
 
 static inline u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
 {
@@ -873,17 +875,17 @@ static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq)
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	sum_w_vruntime_add(cfs_rq, se);
-	se->min_deadline = se->deadline;
+	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
 	se->max_slice = se->slice;
 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
-				__entity_less, &min_deadline_cb);
+				__entity_less, &min_vruntime_cb);
 }
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	rb_erase_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
-				  &min_deadline_cb);
+				  &min_vruntime_cb);
 	sum_w_vruntime_sub(cfs_rq, se);
 }
 
@@ -964,6 +966,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
 	struct sched_entity *curr = cfs_rq->curr;
 	struct sched_entity *best = NULL;
+	struct sched_entity *se;
 
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
@@ -975,65 +978,63 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	if (curr && protect && protect_slice(curr))
 		return curr;
 
+	/* Pick the leftmost entity if it's eligible */
+	se = __pick_first_entity(cfs_rq);
+	if (se && entity_eligible(cfs_rq, se)) {
+		best = se;
+		goto found;
+	}
+
 	while (node) {
 		struct sched_entity *se = __node_2_se(node);
 
 		/*
-		 * If this entity is not eligible, try the left subtree.
+		 * If there's an eligible entity in the left subtree, it is
+		 * always better than any entity in the right subtree or
+		 * the current entity.
 		 */
-		if (!entity_eligible(cfs_rq, se)) {
+		if (node->rb_left && vruntime_eligible(cfs_rq, __node_2_se(node->rb_left)->min_vruntime)) {
 			node = node->rb_left;
 			continue;
 		}
 
 		/*
-		 * If this entity has an earlier deadline than the previous
-		 * best, take this one. If it also has the earliest deadline
-		 * of its subtree, we're done.
+		 * If the current entity is eligible, it is the best we can do
+		 * because there are no eligible entities in the left subtree.
 		 */
-		if (!best || deadline_gt(deadline, best, se)) {
+		if (entity_eligible(cfs_rq, se)) {
 			best = se;
-			if (best->deadline == best->min_deadline)
-				break;
-		}
-
-		/*
-		 * If the earlest deadline in this subtree is in the fully
-		 * eligible left half of our space, go there.
-		 */
-		if (node->rb_left &&
-		    __node_2_se(node->rb_left)->min_deadline == se->min_deadline) {
-			node = node->rb_left;
-			continue;
+			break;
 		}
 
 		node = node->rb_right;
 	}
 
+found:
 	if (!best || (curr && deadline_gt(deadline, best, curr)))
 		best = curr;
 
 	if (unlikely(!best)) {
-    struct sched_entity *left = __pick_first_entity(cfs_rq);
-		pr_err_ratelimited(
-			"EEVDF fail: nr_running=%u sum_w_vrt=%lld sum_weight=%lu "
-			"zero_vrt=%llu curr=%d left_dl=%llu left_eligible=%d\n",
-			cfs_rq->nr_running,
-			cfs_rq->sum_w_vruntime,
-			cfs_rq->sum_weight,
-			cfs_rq->zero_vruntime,
-			!!cfs_rq->curr,
-			left ? left->deadline : 0ULL,
-			left ? entity_eligible(cfs_rq, left) : -1);
-	if (left) {
-        pr_err_ratelimited(
-            "EEVDF fail: left->vruntime=%llu left->min_deadline=%llu "
-            "left->deadline=%llu zero_vrt=%llu\n",
-            left->vruntime, left->min_deadline,
-            left->deadline, cfs_rq->zero_vruntime);
-        return left;
-    }
-}
+		struct sched_entity *left = __pick_first_entity(cfs_rq);
+		if (left) {
+			pr_err_ratelimited(
+				"EEVDF fail: nr_running=%u sum_w_vrt=%lld sum_weight=%lu "
+				"zero_vrt=%llu curr=%d left_dl=%llu left_eligible=%d\n",
+				cfs_rq->nr_running,
+				cfs_rq->sum_w_vruntime,
+				cfs_rq->sum_weight,
+				cfs_rq->zero_vruntime,
+				!!cfs_rq->curr,
+				left->deadline,
+				entity_eligible(cfs_rq, left));
+			pr_err_ratelimited(
+				"EEVDF fail: left->vruntime=%llu left->min_vruntime=%llu "
+				"left->deadline=%llu zero_vrt=%llu\n",
+				left->vruntime, left->min_vruntime,
+				left->deadline, cfs_rq->zero_vruntime);
+			return left;
+		}
+	}
 
 	return best;
 }
@@ -1077,10 +1078,10 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
  * XXX: strictly: vd_i += N*r_i/w_i such that: vd_i > ve_i
  * this is probably good enough.
  */
-static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
+static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	if ((s64)(se->vruntime - se->deadline) < 0)
-		return;
+		return false;
 
 	/*
 	 * For EEVDF the virtual time slope is determined by w_i (iow.
@@ -1095,13 +1096,7 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
 	avg_vruntime(cfs_rq);
 
-	/*
-	 * The task has consumed its request, reschedule.
-	 */
-	if (cfs_rq->nr_running > 1) {
-		resched_curr(rq_of(cfs_rq));
-		clear_buddies(cfs_rq, se);
-	}
+	return true;
 }
 
 #include "pelt.h"
@@ -1228,6 +1223,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	struct sched_entity *curr = cfs_rq->curr;
 	u64 now = rq_clock_task(rq_of(cfs_rq));
 	u64 delta_exec;
+	bool resched;
 
 	if (unlikely(!curr))
 		return;
@@ -1245,7 +1241,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
-	update_deadline(cfs_rq, curr);
+	resched = update_deadline(cfs_rq, curr);
 	update_min_vruntime(cfs_rq);
 
 	if (entity_is_task(curr)) {
@@ -1257,6 +1253,14 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	}
 
 	account_cfs_rq_runtime(cfs_rq, delta_exec);
+
+	if (cfs_rq->nr_queued == 1)
+		return;
+
+	if (resched || !protect_slice(curr)) {
+		resched_curr(rq_of(cfs_rq));
+		clear_buddies(cfs_rq, curr);
+	}
 }
 
 static void update_curr_fair(struct rq *rq)
@@ -4238,7 +4242,7 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	if (sched_feat(PLACE_LAG) && cfs_rq->nr_queued && se->vlag) {
 		struct sched_entity *curr = cfs_rq->curr;
-		unsigned long load;
+		unsigned long load, weight;
 
 		lag = se->vlag;
 
@@ -4246,10 +4250,13 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 		if (curr && curr->on_rq)
 			load += scale_load_down(curr->load.weight);
 
-		lag *= load + scale_load_down(se->load.weight);
+		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+		lag *= load + weight;
 		if (WARN_ON_ONCE(!load))
 			load = 1;
-		lag = div_s64(lag, load);
+		lag = div64_long(lag, load);
+
+		update_zero_vruntime(cfs_rq, -lag);
 	}
 
 	se->vruntime = vruntime - lag;
@@ -4542,12 +4549,6 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 		resched_curr(rq_of(cfs_rq));
 		return;
 	}
-	/*
-	 * don't let the period tick interfere with the hrtick preemption
-	 */
-	if (!sched_feat(DOUBLE_TICK) &&
-			hrtimer_active(&rq_of(cfs_rq)->hrtick_timer))
-		return;
 #endif
 }
 
