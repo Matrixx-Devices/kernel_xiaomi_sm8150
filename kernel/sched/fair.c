@@ -4003,7 +4003,7 @@ static inline unsigned long cfs_rq_load_avg(struct cfs_rq *cfs_rq)
 	return cfs_rq->avg.load_avg;
 }
 
-static int idle_balance(struct rq *this_rq, struct rq_flags *rf);
+static int newidle_balance(struct rq *this_rq, struct rq_flags *rf);
 
 static inline bool task_fits_capacity(struct task_struct *p, long capacity,
 								int cpu);
@@ -4171,7 +4171,7 @@ attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
 static inline void
 detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
 
-static inline int idle_balance(struct rq *rq, struct rq_flags *rf)
+static inline int newidle_balance(struct rq *rq, struct rq_flags *rf)
 {
 	return 0;
 }
@@ -9069,10 +9069,10 @@ simple:
 
 idle:
 	update_misfit_status(NULL, rq);
-	new_tasks = idle_balance(rq, rf);
+	new_tasks = newidle_balance(rq, rf);
 
 	/*
-	 * Because idle_balance() releases (and re-acquires) rq->lock, it is
+	 * Because newidle_balance() releases (and re-acquires) rq->lock, it is
 	 * possible for any higher priority task to appear. In that case we
 	 * must re-start the pick_next_entity() loop.
 	 */
@@ -11556,7 +11556,7 @@ out_one_pinned:
 	ld_moved = 0;
 
 	/*
-	 * idle_balance() disregards balance intervals, so we could repeatedly
+	 * newidle_balance() disregards balance intervals, so we could repeatedly
 	 * reach this code, which would lead to balance_interval skyrocketting
 	 * in a short amount of time. Skip the balance_interval increase logic
 	 * to avoid that.
@@ -11682,7 +11682,7 @@ static inline void update_newidle_stats(struct sched_domain *sd, unsigned int su
 }
 
 /*
- * idle_balance is called by schedule() if this_cpu is about to become
+ * newidle_balance is called by schedule() if this_cpu is about to become
  * idle. Attempts to pull tasks from other CPUs.
  */
 static bool
@@ -11703,7 +11703,28 @@ update_newidle_cost(struct sched_domain *sd, u64 cost, unsigned int success)
 	return false;
 }
 
-static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
+#ifdef CONFIG_NO_HZ_COMMON
+static void nohz_newidle_balance(struct rq *this_rq)
+{
+	int this_cpu = this_rq->cpu;
+
+	if (!is_housekeeping_cpu(this_cpu))
+		return;
+
+	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+		return;
+
+	nohz_balancer_kick(true);
+}
+#else
+static inline void nohz_newidle_balance(struct rq *this_rq) { }
+#endif
+
+/*
+ * idle_balance is called by schedule() if this_cpu is about to become
+ * idle. Attempts to pull tasks from other CPUs.
+ */
+static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
 	int this_cpu = this_rq->cpu;
@@ -11712,13 +11733,23 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 	u64 curr_cost = 0;
 	u64 t0;
 	bool force_lb = false;
+	u64 avg_idle = this_rq->avg_idle;
 
 	if (cpu_isolated(this_cpu))
 		return 0;
 
+	update_misfit_status(NULL, this_rq);
+
 	/*
-	 * We must set idle_stamp _before_ calling idle_balance(), such that we
-	 * measure the duration of idle_balance() as idle time.
+	 * There is a task waiting to run. No need to search for one.
+	 * Return 0; the task will be enqueued when switching to idle.
+	 */
+	if (!llist_empty(&this_rq->wake_list))
+		return 0;
+
+	/*
+	 * We must set idle_stamp _before_ calling newidle_balance(), such that we
+	 * measure the duration of newidle_balance() as idle time.
 	 */
 	this_rq->idle_stamp = rq_clock(this_rq);
 
@@ -11747,10 +11778,14 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 
 	rcu_read_lock();
 	sd = rcu_dereference_check_sched_domain(this_rq->sd);
+	if (!sd) {
+		rcu_read_unlock();
+		goto out;
+	}
+
 	if (!READ_ONCE(this_rq->rd->overload) ||
-	    (sd && this_rq->avg_idle < sd->max_newidle_lb_cost)) {
-		if (sd)
-			update_next_balance(sd, &next_balance);
+	    avg_idle < sd->max_newidle_lb_cost) {
+		update_next_balance(sd, &next_balance);
 		rcu_read_unlock();
 		goto out;
 	}
@@ -11771,6 +11806,8 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 		int continue_balancing = 1;
 		u64 t1, domain_cost;
 
+		update_next_balance(sd, &next_balance);
+
 		if (!(sd->flags & SD_LOAD_BALANCE)) {
 			if (time_after_eq(jiffies,
 					  sd->groups->sgc->next_update))
@@ -11779,10 +11816,8 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 		}
 
 		if (!force_lb &&
-		    this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost) {
-			update_next_balance(sd, &next_balance);
+		    avg_idle < curr_cost + sd->max_newidle_lb_cost)
 			break;
-		}
 
 		if (sd->flags & SD_BALANCE_NEWIDLE) {
 			unsigned int weight = 1;
@@ -11797,7 +11832,6 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 				weight = 1 + sd->newidle_ratio;
 				if (d1k > weight) {
 					update_newidle_stats(sd, 0);
-					update_next_balance(sd, &next_balance);
 					continue;
 				}
 				weight = (1024 + weight/2) / weight;
@@ -11815,13 +11849,11 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 			update_newidle_cost(sd, domain_cost, weight * !!pulled_task);
 		}
 
-		update_next_balance(sd, &next_balance);
-
 		/*
 		 * Stop searching for tasks to pull if there are
 		 * now runnable tasks on this rq.
 		 */
-		if (pulled_task || this_rq->nr_running > 0)
+		if (pulled_task || this_rq->nr_running > 0 || !continue_balancing)
 			break;
 	}
 	rcu_read_unlock();
@@ -11850,6 +11882,8 @@ out:
 
 	if (pulled_task)
 		this_rq->idle_stamp = 0;
+	else
+		nohz_newidle_balance(this_rq);
 
 	rq_repin_lock(this_rq, rf);
 
