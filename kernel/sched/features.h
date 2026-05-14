@@ -10,9 +10,9 @@ SCHED_FEAT(GENTLE_FAIR_SLEEPERS, false)
  * Place new tasks ahead so that they do not starve already running
  * tasks
  */
-SCHED_FEAT(START_DEBIT, true)
-SCHED_FEAT(PLACE_LAG, true)
-SCHED_FEAT(PLACE_DEADLINE_INITIAL, true)
+SCHED_FEAT(START_DEBIT, false)
+SCHED_FEAT(PLACE_LAG, false)
+SCHED_FEAT(PLACE_DEADLINE_INITIAL, false)
 SCHED_FEAT(DELAY_DEQUEUE, false)
 SCHED_FEAT(DELAY_ZERO, true)
 
