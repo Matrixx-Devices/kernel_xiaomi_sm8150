@@ -521,6 +521,8 @@ struct sched_entity {
 	struct rb_node			run_node;
 	u64				deadline;
 	u64				min_deadline;
+	u64				min_slice;
+	u64				max_slice;
 
 	struct list_head		group_node;
 	unsigned int			on_rq;
@@ -529,7 +531,15 @@ struct sched_entity {
 	u64				sum_exec_runtime;
 	u64				vruntime;
 	u64				prev_sum_exec_runtime;
-	s64				vlag;
+	/*
+	 * When !@on_rq this field is vlag.
+	 * When @on_rq and @sched_delayed, or when being picked,
+	 * this field is vprot. See protect_slice().
+	 */
+	union {
+		s64			vlag;
+		u64			vprot;
+	};
 	u64				slice;
 
 	unsigned char			sched_delayed;
