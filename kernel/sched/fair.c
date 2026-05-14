@@ -949,6 +949,9 @@ static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity 
 	u64 slice = normalized_sysctl_sched_base_slice;
 	u64 vprot = se->deadline;
 
+	if (sched_feat(RUN_TO_PARITY))
+		slice = cfs_rq_min_slice(cfs_rq);
+
 	slice = min(slice, se->slice);
 	if (slice != se->slice)
 		vprot = min_vruntime(vprot, se->vruntime + calc_delta_fair(slice, se));
@@ -1001,6 +1004,10 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
+
+	if (sched_feat(PICK_BUDDY) && protect &&
+	    cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next))
+		return cfs_rq->next;
 
 	if (curr && protect && protect_slice(curr))
 		return curr;
@@ -8887,15 +8894,59 @@ static void set_next_buddy(struct sched_entity *se)
 	}
 }
 
+enum preempt_wakeup_action {
+	PREEMPT_WAKEUP_NONE,	/* No preemption. */
+	PREEMPT_WAKEUP_SHORT,	/* Ignore slice protection. */
+	PREEMPT_WAKEUP_PICK,	/* Let pick_eevdf() decide. */
+	PREEMPT_WAKEUP_RESCHED,	/* Force reschedule. */
+};
+
+static inline bool
+set_preempt_buddy(struct cfs_rq *cfs_rq,
+		  struct sched_entity *pse, struct sched_entity *se)
+{
+	/*
+	 * Keep existing buddy if its deadline is sooner than pse.
+	 * Obeying the deadline is more in line with EEVDF objectives.
+	 */
+	if (cfs_rq->next && entity_before(cfs_rq->next, pse))
+		return false;
+
+	set_next_buddy(pse);
+	return true;
+}
+
+/*
+ * WF_SYNC indicates the waker expects to sleep after wakeup. If the wakee
+ * has an earlier deadline and the waker has been running long enough, force
+ * preemption to hand off the CPU promptly.
+ */
+static inline enum preempt_wakeup_action
+preempt_sync(struct rq *rq, int wake_flags,
+	     struct sched_entity *pse, struct sched_entity *se)
+{
+	u64 threshold = sysctl_sched_migration_cost;
+	u64 delta;
+
+	delta = rq_clock_task(rq) - se->exec_start;
+	if ((s64)delta < 0)
+		delta = 0;
+
+	if (entity_before(pse, se) && delta >= threshold)
+		return PREEMPT_WAKEUP_RESCHED;
+
+	return PREEMPT_WAKEUP_NONE;
+}
+
 /*
  * Preempt the current task with a newly woken task if needed:
  */
 static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_flags)
 {
+	enum preempt_wakeup_action preempt_action = PREEMPT_WAKEUP_PICK;
 	struct task_struct *curr = rq->curr;
 	struct sched_entity *se = &curr->se, *pse = &p->se;
 	struct cfs_rq *cfs_rq = task_cfs_rq(curr);
-	int next_buddy_marked = 0;
 
 	if (unlikely(se == pse))
 		return;
@@ -8908,11 +8959,6 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	 */
 	if (unlikely(throttled_hierarchy(cfs_rq_of(pse))))
 		return;
-
-	if (sched_feat(NEXT_BUDDY) && !(wake_flags & WF_FORK)) {
-		set_next_buddy(pse);
-		next_buddy_marked = 1;
-	}
 
 	/*
 	 * We can come here with TIF_NEED_RESCHED already set from new task
@@ -8951,23 +8997,52 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	 */
 	if (sched_feat(PREEMPT_SHORT) && pse->slice < se->slice &&
 	    entity_eligible(cfs_rq, pse)) {
-		cancel_protect_slice(se);
-		clear_buddies(cfs_rq, se);
-		goto preempt;
+		preempt_action = PREEMPT_WAKEUP_SHORT;
+		goto pick;
 	}
 
 	/*
-	 * XXX pick_eevdf(cfs_rq) != se ?
+	 * Ignore wakee preemption on WF_FORK as it is less likely that
+	 * there is shared data as exec often follow fork. Do not
+	 * preempt for tasks that are sched_delayed as it would violate
+	 * EEVDF to forcibly queue an ineligible task.
 	 */
-	if (pick_eevdf(cfs_rq, false) == pse)
+	if ((wake_flags & WF_FORK) || pse->sched_delayed)
+		return;
+
+	/* Prefer picking wakee soon if appropriate. */
+	if (sched_feat(NEXT_BUDDY) &&
+	    set_preempt_buddy(cfs_rq, pse, se)) {
+		if (wake_flags & WF_SYNC)
+			preempt_action = preempt_sync(rq, wake_flags, pse, se);
+	}
+
+	switch (preempt_action) {
+	case PREEMPT_WAKEUP_NONE:
+		return;
+	case PREEMPT_WAKEUP_RESCHED:
+		goto preempt;
+	case PREEMPT_WAKEUP_SHORT:
+		/* fallthrough */
+	case PREEMPT_WAKEUP_PICK:
+		break;
+	}
+
+pick:
+	if (pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) == pse)
 		goto preempt;
 
-	if (sched_feat(NEXT_BUDDY) && !(wake_flags & WF_FORK))
+	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
 
 	return;
 
 preempt:
+	if (preempt_action == PREEMPT_WAKEUP_SHORT) {
+		cancel_protect_slice(se);
+		clear_buddies(cfs_rq, se);
+	}
+
 	resched_curr(rq);
 }
 

@@ -150,6 +150,19 @@ SCHED_FEAT(ENFORCE_ELIGIBILITY, false)
 SCHED_FEAT(PREEMPT_SHORT, true)
 
 /*
+ * EEVDF: Protect the current task's slice against preemption only up to the
+ * minimum slice of all runnable tasks (run-to-parity). When disabled, the
+ * full normalized base slice is used as the protection window.
+ */
+SCHED_FEAT(RUN_TO_PARITY, false)
+
+/*
+ * EEVDF: Honor the ->next buddy hint when picking the next task, allowing
+ * cache-warm tasks to run ahead of strict deadline order.
+ */
+SCHED_FEAT(PICK_BUDDY, true)
+
+/*
  * Do newidle balancing proportional to its success rate using randomization.
  */
 SCHED_FEAT(NI_RANDOM, true)
