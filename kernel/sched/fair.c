@@ -11728,15 +11728,11 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
 	int this_cpu = this_rq->cpu;
+	int continue_balancing = 1;
+	u64 t0, t1, curr_cost = 0;
 	struct sched_domain *sd;
 	int pulled_task = 0;
-	u64 curr_cost = 0;
-	u64 t0;
-	bool force_lb = false;
 	u64 avg_idle = this_rq->avg_idle;
-
-	if (cpu_isolated(this_cpu))
-		return 0;
 
 	update_misfit_status(NULL, this_rq);
 
@@ -11748,8 +11744,8 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 		return 0;
 
 	/*
-	 * We must set idle_stamp _before_ calling newidle_balance(), such that we
-	 * measure the duration of newidle_balance() as idle time.
+	 * We must set idle_stamp _before_ calling newidle_balance(), such that
+	 * we measure the duration of newidle_balance() as idle time.
 	 */
 	this_rq->idle_stamp = rq_clock(this_rq);
 
@@ -11758,15 +11754,6 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	 */
 	if (!cpu_active(this_cpu))
 		return 0;
-
-	/*
-	 * Force higher capacity CPUs doing load balance, when the lower
-	 * capacity CPUs has some misfit tasks.
-	 */
-	if (!is_min_capacity_cpu(this_cpu) &&
-		(atomic_read(&this_rq->nr_iowait) == 0) &&
-		min_cap_cluster_has_misfit_task())
-		force_lb = true;
 
 	/*
 	 * This is OK, because current is on_cpu, which avoids it being picked
@@ -11785,6 +11772,7 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 
 	if (!READ_ONCE(this_rq->rd->overload) ||
 	    avg_idle < sd->max_newidle_lb_cost) {
+
 		update_next_balance(sd, &next_balance);
 		rcu_read_unlock();
 		goto out;
@@ -11803,20 +11791,11 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 
 	rcu_read_lock();
 	for_each_domain(this_cpu, sd) {
-		int continue_balancing = 1;
-		u64 t1, domain_cost;
+		u64 domain_cost;
 
 		update_next_balance(sd, &next_balance);
 
-		if (!(sd->flags & SD_LOAD_BALANCE)) {
-			if (time_after_eq(jiffies,
-					  sd->groups->sgc->next_update))
-				update_group_capacity(sd, this_cpu);
-			continue;
-		}
-
-		if (!force_lb &&
-		    avg_idle < curr_cost + sd->max_newidle_lb_cost)
+		if (avg_idle < curr_cost + sd->max_newidle_lb_cost)
 			break;
 
 		if (sd->flags & SD_BALANCE_NEWIDLE) {
@@ -11846,6 +11825,10 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 			curr_cost += domain_cost;
 			t0 = t1;
 
+			/*
+			 * Track max cost of a domain to make sure to not delay
+			 * the next wakeup on the CPU.
+			 */
 			update_newidle_cost(sd, domain_cost, weight * !!pulled_task);
 		}
 
@@ -11853,7 +11836,7 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 		 * Stop searching for tasks to pull if there are
 		 * now runnable tasks on this rq.
 		 */
-		if (pulled_task || this_rq->nr_running > 0 || !continue_balancing)
+		if (pulled_task || !continue_balancing)
 			break;
 	}
 	rcu_read_unlock();
@@ -11868,17 +11851,17 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	 * have been enqueued in the meantime. Since we're not going idle,
 	 * pretend we pulled a task.
 	 */
-	if (this_rq->cfs.h_nr_running && !pulled_task)
+	if (this_rq->cfs.h_nr_queued && !pulled_task)
 		pulled_task = 1;
+
+	/* Is there a task of a high priority class? */
+	if (this_rq->nr_running != this_rq->cfs.h_nr_queued)
+		pulled_task = -1;
 
 out:
 	/* Move the next balance forward */
 	if (time_after(this_rq->next_balance, next_balance))
 		this_rq->next_balance = next_balance;
-
-	/* Is there a task of a high priority class? */
-	if (this_rq->nr_running != this_rq->cfs.h_nr_running)
-		pulled_task = -1;
 
 	if (pulled_task)
 		this_rq->idle_stamp = 0;
