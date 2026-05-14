@@ -115,7 +115,7 @@ unsigned int __read_mostly sysctl_sched_energy_aware = 1;
  */
 unsigned int sysctl_sched_child_runs_first __read_mostly;
 
-const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
+const_debug unsigned int sysctl_sched_migration_cost	= 0UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
 #ifdef CONFIG_SCHED_WALT
@@ -8992,11 +8992,10 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	update_curr(cfs_rq);
 
 	/*
-	 * If @p has a shorter slice than current and @p is eligible, override
-	 * current's slice protection in order to allow preemption.
+	 * If @p has a shorter slice than current, override current's slice
+	 * protection to allow preemption. No eligibility check - e404 style.
 	 */
-	if (sched_feat(PREEMPT_SHORT) && pse->slice < se->slice &&
-	    entity_eligible(cfs_rq, pse)) {
+	if (sched_feat(PREEMPT_SHORT) && pse->slice < se->slice) {
 		preempt_action = PREEMPT_WAKEUP_SHORT;
 		goto pick;
 	}
@@ -9028,9 +9027,20 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 		break;
 	}
 
-pick:
-	if (pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) == pse)
+pick: {
+	struct sched_entity *nse;
+
+	nse = pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT);
+	if (nse == pse)
 		goto preempt;
+
+	/*
+	 * nse == NULL means a delayed task was dequeued. If entities
+	 * remain queued, retry to check if pse surfaces as the pick.
+	 */
+	if (!nse && cfs_rq->nr_queued)
+		goto pick;
+}
 
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
