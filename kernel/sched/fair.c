@@ -1093,6 +1093,7 @@ static void update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	 * EEVDF: vd_i = ve_i + r_i / w_i
 	 */
 	se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
+	avg_vruntime(cfs_rq);
 
 	/*
 	 * The task has consumed its request, reschedule.
@@ -11684,6 +11685,24 @@ static inline void update_newidle_stats(struct sched_domain *sd, unsigned int su
  * idle_balance is called by schedule() if this_cpu is about to become
  * idle. Attempts to pull tasks from other CPUs.
  */
+static bool
+update_newidle_cost(struct sched_domain *sd, u64 cost, unsigned int success)
+{
+	if (cost > sd->max_newidle_lb_cost) {
+		sd->max_newidle_lb_cost = cost;
+		sd->last_decay_max_lb_cost = jiffies;
+	} else if (time_after(jiffies, sd->last_decay_max_lb_cost + HZ)) {
+		sd->max_newidle_lb_cost = (sd->max_newidle_lb_cost * 253) / 256;
+		sd->last_decay_max_lb_cost = jiffies;
+		return true;
+	}
+
+	if (cost)
+		update_newidle_stats(sd, success);
+
+	return false;
+}
+
 static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 {
 	unsigned long next_balance = jiffies + HZ;
@@ -11793,10 +11812,7 @@ static int idle_balance(struct rq *this_rq, struct rq_flags *rf)
 			curr_cost += domain_cost;
 			t0 = t1;
 
-			if (domain_cost > sd->max_newidle_lb_cost)
-				sd->max_newidle_lb_cost = domain_cost;
-
-			update_newidle_stats(sd, weight * !!pulled_task);
+			update_newidle_cost(sd, domain_cost, weight * !!pulled_task);
 		}
 
 		update_next_balance(sd, &next_balance);
@@ -12187,12 +12203,8 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
 		 * Decay the newidle max times here because this is a regular
 		 * visit to all the domains. Decay ~1% per second.
 		 */
-		if (time_after(jiffies, sd->next_decay_max_lb_cost)) {
-			sd->max_newidle_lb_cost =
-				(sd->max_newidle_lb_cost * 253) / 256;
-			sd->next_decay_max_lb_cost = jiffies + HZ;
+		if (update_newidle_cost(sd, 0, 0))
 			need_decay = 1;
-		}
 		max_cost += sd->max_newidle_lb_cost;
 
 		if (energy_aware() && !sd_overutilized(sd))
