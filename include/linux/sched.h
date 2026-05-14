@@ -843,6 +843,7 @@ struct task_struct {
 	struct task_struct		*last_wakee;
 
 	int				wake_cpu;
+	int				recent_used_cpu;
 #endif
 	int				on_rq;
 

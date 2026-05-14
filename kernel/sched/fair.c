@@ -968,6 +968,13 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 	struct sched_entity *best = NULL;
 	struct sched_entity *se;
 
+	/*
+	 * We can safely skip eligibility check if there is only one entity
+	 * in this cfs_rq, saving some cycles.
+	 */
+	if (cfs_rq->nr_queued == 1)
+		return curr && curr->on_rq ? curr : __pick_first_entity(cfs_rq);
+
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
 
@@ -7467,7 +7474,7 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 static inline int __select_idle_sibling(struct task_struct *p, int prev, int target)
 {
 	struct sched_domain *sd;
-	int i;
+	int i, recent_used_cpu;
 
 	if (idle_cpu(target) && !cpu_isolated(target))
 		return target;
@@ -7478,6 +7485,19 @@ static inline int __select_idle_sibling(struct task_struct *p, int prev, int tar
 	if (prev != target && cpus_share_cache(prev, target) &&
 				idle_cpu(prev) && !cpu_isolated(prev))
 		return prev;
+
+	/* Check a recently used CPU as a potential idle candidate: */
+	recent_used_cpu = p->recent_used_cpu;
+	p->recent_used_cpu = prev;
+	if (recent_used_cpu != prev &&
+	    recent_used_cpu != target &&
+	    cpus_share_cache(recent_used_cpu, target) &&
+	    idle_cpu(recent_used_cpu) &&
+	    !cpu_isolated(recent_used_cpu) &&
+	    cpumask_test_cpu(recent_used_cpu, &p->cpus_allowed)) {
+		p->recent_used_cpu = prev;
+		return recent_used_cpu;
+	}
 
 	sd = rcu_dereference(per_cpu(sd_llc, target));
 	if (!sd)
@@ -11713,6 +11733,9 @@ static void nohz_newidle_balance(struct rq *this_rq)
 		return;
 
 	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+		return;
+
+	if (time_before(jiffies, READ_ONCE(this_rq->next_balance)))
 		return;
 
 	nohz_balancer_kick(true);
